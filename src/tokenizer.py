@@ -7,21 +7,23 @@ from multiprocessing import Pool, Process, Queue
 import time
 
 class BPETokenizer:
-    def __init__(self, merge_num=30000):
+    def __init__(self, merge_num=30000, special_tokens=[b'<|endoftext|>']):
         self.merge_num = merge_num
         self.vocab = {}
         self.inverse_vocab = {}
         self.merge_list = []
         self.merge_rank = {}
-        self.special_vocab = {b'<|endoftext|>': 0}
-        self.vocab_size = self.merge_num + 256 + len(self.special_vocab.keys())
+        self.special_vocab = {}
+        for i, item in enumerate(special_tokens):
+            self.special_vocab[item] = i + 256
+        self.vocab_size = self.merge_num + 256 + len(self.special_vocab)
         self._init_byte_vocab()
+        self.eos_id = b'<|endoftext|>'
 
     def _init_byte_vocab(self):
-        special_token_num = len(self.special_vocab.keys())
         for i in range(256):
-            self.vocab[bytes([i])] = i + special_token_num
-            self.inverse_vocab[i + special_token_num] = bytes([i])
+            self.vocab[bytes([i])] = i
+            self.inverse_vocab[i] = bytes([i])
         for i in self.special_vocab.keys():
             self.vocab[i] = self.special_vocab[i]
             self.inverse_vocab[self.special_vocab[i]] = i
@@ -162,7 +164,9 @@ class BPETokenizer:
     def load(self, path):
         with open(path, 'r') as f:
             data = json.load(f)
-            self.vocab = {k.encode("utf-8"): v for k, v in data['vocab'].items()}
+            for k, v in data['vocab'].items():
+                if v >= 256:
+                    self.vocab[k.encode("utf-8")] = v
             self.vocab_size = data['vocab_size']
             self.special_vocab = {k.encode("utf-8"): v for k, v in data['special_vocab'].items()}
             self.merge_list = data['merge_list']
@@ -296,16 +300,17 @@ class BPETokenizer:
                 self.merge_rank[tuple(self.merge_list[i])] = i
 
 if __name__ == "__main__":
-    tokenizer = BPETokenizer(30000)
-    start = time.time()
-    tokenizer.train("../data/TinyStoriesV2-GPT4-valid.txt")
-    duration = time.time() - start
-    print(f"Total {duration} seconds past.")
-    tokenizer.save("tokenizer.json")
+    tokenizer = BPETokenizer(10000-257)
+    #start = time.time()
+    #tokenizer.train("../data/TinyStoriesV2-GPT4-train.txt")
+    #duration = time.time() - start
+    #print(f"Total {duration} seconds past.")
+    #tokenizer.save("tokenizer.json")
     tokenizer.load("tokenizer.json")
     string = "Hello, I am a cuda programmer who is very good at optimizing performance.\n<|endoftext|>"
     bstring = string.encode('utf-8')
     int_array = tokenizer.encode(bstring)
+    print(len(bstring)/len(int_array))
     print(tokenizer.vocab[b' '], tokenizer.vocab[b'\n'])
     print(int_array)
     string = tokenizer.decode(int_array)
