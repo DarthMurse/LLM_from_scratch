@@ -25,7 +25,7 @@ class TrainConfig:
     save_dir: str = "../out/"
     name: str = "TinyStories_22M"
     save_iter: int = 50000
-    log_iter: int = 100
+    log_iter: int = 10
     eval_iter: int = 1000
     # gradient clipping
     clip_threshold = 1.0
