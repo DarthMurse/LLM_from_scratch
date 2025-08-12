@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 from dataclasses import dataclass
 import math
 
@@ -45,8 +46,8 @@ class CrossEntropyLoss(nn.Module):
         super().__init__()
 
     def forward(self, logit, target):
-        # logits: [..., vocab_size], logits before softmax
-        # target: [...], value \in [0, vocab_size-1], ground truth
+        # logits: [B, vocab_size], logits before softmax
+        # target: [B], value \in [0, vocab_size-1], ground truth
         assert logit.shape[0] == target.shape[0], f"logits and target must have the same dimension, current shape {logit.shape}, {target.shape}"
         max_logit = logit.max(dim=-1).values.detach()
         selected_logit = torch.gather(logit, -1, target.unsqueeze(-1))
@@ -60,6 +61,7 @@ class RMSNorm(nn.Module):
         self.dim = dim
         self.eps = 1e-6
 
+    @nvtx.range("RMSNorm")
     def forward(self, x):
         scale = torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
         return scale * x
@@ -80,12 +82,16 @@ class SwiGLU(nn.Module):
         self.gate_proj = Linear(config.hidden_dim, config.intermediate_dim, config.bias)
         self.down_proj = Linear(config.intermediate_dim, config.hidden_dim, config.bias)
 
+    @nvtx.range("mlp")
     def forward(self, x):
-        up = self.up_proj(x)
-        gate = self.gate_proj(x)
-        gate = gate / (1 + torch.exp(-gate))
-        up = up * gate 
-        y = self.down_proj(up)
+        with nvtx.range("mlp up"):
+            up = self.up_proj(x)
+        with nvtx.range("mlp gate"):
+            gate = self.gate_proj(x)
+            gate = gate / (1 + torch.exp(-gate))
+            up = up * gate 
+        with nvtx.range("mlp down"):
+            y = self.down_proj(up)
         return y
 
 class Transformer(nn.Module):
@@ -157,50 +163,56 @@ class Attention(nn.Module):
         self.k_cache = None
         self.v_cache = None
 
+    @nvtx.range("multi-head attention")
     def forward(self, x, cos, sin, inference=False):
-        z = self.qkv_proj(x)
-        q, k, v = torch.split(z, [self.config.hidden_dim, int(self.config.hidden_dim / self.config.q_per_kv), int(self.config.hidden_dim / self.config.q_per_kv)], dim=-1)
-        
-        B, S, D = q.shape
-        q = q.reshape(B, S, self.config.num_head, self.config.head_dim) # [B, S, H, D_h]
-        k = k.reshape(B, S, self.config.num_kv_head, self.config.head_dim) # [B, S, H_kv, D_h]
-        v = v.reshape(B, S, self.config.num_kv_head, self.config.head_dim) # [B, S, H_kv, D_h]
+        with nvtx.range("attention qkv"):
+            z = self.qkv_proj(x)
+        with nvtx.range("attention score"):
+            q, k, v = torch.split(z, [self.config.hidden_dim, int(self.config.hidden_dim / self.config.q_per_kv), int(self.config.hidden_dim / self.config.q_per_kv)], dim=-1)
+            
+            B, S, D = q.shape
+            q = q.reshape(B, S, self.config.num_head, self.config.head_dim) # [B, S, H, D_h]
+            k = k.reshape(B, S, self.config.num_kv_head, self.config.head_dim) # [B, S, H_kv, D_h]
+            v = v.reshape(B, S, self.config.num_kv_head, self.config.head_dim) # [B, S, H_kv, D_h]
 
-        q = q.transpose(1, 2) # [B, H, S, D_h]
-        k = k.transpose(1, 2) # [B, H_kv, S, D_h]
-        v = v.transpose(1, 2) # [B, H_kv, S, D_h]
+            q = q.transpose(1, 2) # [B, H, S, D_h]
+            k = k.transpose(1, 2) # [B, H_kv, S, D_h]
+            v = v.transpose(1, 2) # [B, H_kv, S, D_h]
 
-        if inference:
-            current_idx = self.k_cache.shape[2] if self.k_cache is not None else 0
-            current_len = q.shape[2]
-            cos = cos[current_idx: current_idx + current_len]
-            sin = sin[current_idx: current_idx + current_len]
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+            if inference:
+                current_idx = self.k_cache.shape[2] if self.k_cache is not None else 0
+                current_len = q.shape[2]
+                cos = cos[current_idx: current_idx + current_len]
+                sin = sin[current_idx: current_idx + current_len]
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
 
-        if inference:
-            if self.k_cache is None or self.v_cache is None:
-                self.k_cache, self.v_cache = k, v
+            if inference:
+                if self.k_cache is None or self.v_cache is None:
+                    self.k_cache, self.v_cache = k, v
+                else:
+                    self.k_cache = torch.concat([self.k_cache, k], dim=2)
+                    self.v_cache = torch.concat([self.v_cache, v], dim=2)
+                    k = self.k_cache
+                    v = self.v_cache
+
+            k = k.repeat(1, self.config.q_per_kv, 1, 1)
+            v = v.repeat(1, self.config.q_per_kv, 1, 1)
+
+            scale = 1 / math.sqrt(self.config.head_dim)
+            if not inference:
+                mask = torch.ones([S, S], device=q.device, dtype=torch.bool).tril()
+                attn_bias = torch.where(mask, 0, float("-inf"))
             else:
-                self.k_cache = torch.concat([self.k_cache, k], dim=2)
-                self.v_cache = torch.concat([self.v_cache, v], dim=2)
-                k = self.k_cache
-                v = self.v_cache
-
-        k = k.repeat(1, self.config.q_per_kv, 1, 1)
-        v = v.repeat(1, self.config.q_per_kv, 1, 1)
-
-        scale = 1 / math.sqrt(self.config.head_dim)
-        if not inference:
-            mask = torch.ones([S, S], device=q.device, dtype=torch.bool).tril()
-            attn_bias = torch.where(mask, 0, float("-inf"))
-        else:
-            attn_bias = 0
-        attn_weight = q @ k.transpose(-1, -2) * scale + attn_bias
-        attn_weight = softmax(attn_weight, dim=-1)
-        out = attn_weight @ v # [B, H, S, D_h]
-        out = out.transpose(1, 2).reshape(B, S, D)
-        y = self.out_proj(out)
+                attn_bias = 0
+            attn_weight = q @ k.transpose(-1, -2) * scale + attn_bias
+        with nvtx.range("attention softmax"):
+            attn_weight = softmax(attn_weight, dim=-1)
+        with nvtx.range("attention result"):
+            out = attn_weight @ v # [B, H, S, D_h]
+            out = out.transpose(1, 2).reshape(B, S, D)
+        with nvtx.range("attention output"):
+            y = self.out_proj(out)
         return y
 
 if __name__ == "__main__":
