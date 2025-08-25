@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.cuda.nvtx as nvtx
 from dataclasses import dataclass
 import math
+from ops.fused_attention import torch_attention, triton_attention
 
 @dataclass
 class ModelConfig:
@@ -60,11 +61,12 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = 1e-6
+        self.weight = nn.Parameter(torch.ones([dim]))
 
     @nvtx.range("RMSNorm")
     def forward(self, x):
         scale = torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + self.eps)
-        return scale * x
+        return scale * x * self.weight
 
 class Embedding(nn.Module):
     def __init__(self, index_num, dim):
@@ -199,18 +201,14 @@ class Attention(nn.Module):
             k = k.repeat(1, self.config.q_per_kv, 1, 1)
             v = v.repeat(1, self.config.q_per_kv, 1, 1)
 
-            scale = 1 / math.sqrt(self.config.head_dim)
-            if not inference:
-                mask = torch.ones([S, S], device=q.device, dtype=torch.bool).tril()
-                attn_bias = torch.where(mask, 0, float("-inf"))
-            else:
-                attn_bias = 0
-            attn_weight = q @ k.transpose(-1, -2) * scale + attn_bias
-        with nvtx.range("attention softmax"):
-            attn_weight = softmax(attn_weight, dim=-1)
-        with nvtx.range("attention result"):
-            out = attn_weight @ v # [B, H, S, D_h]
-            out = out.transpose(1, 2).reshape(B, S, D)
+        if inference:
+            atten_weight = softmax(q @ k.transpose(-1, -2) / math.sqrt(config.head_dim), dim=-1)
+            out = atten_weight @ v
+        else:
+            #out = torch_attention(q, k, v)
+            out = triton_attention(q, k, v)
+
+        out = out.transpose(1, 2).reshape(B, S, D)
         with nvtx.range("attention output"):
             y = self.out_proj(out)
         return y

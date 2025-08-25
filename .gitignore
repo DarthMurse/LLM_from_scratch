@@ -1,0 +1,6 @@
+__pycache__
+*.ckpt
+*.pth
+*.txt
+*.pickle
+*.html

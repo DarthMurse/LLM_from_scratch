@@ -67,6 +67,8 @@ class AdamW(Optimizer):
 
                 state["t"] = t + 1
                 state["betas_pow"] = (betas_pow[0] * betas[0], betas_pow[1] * betas[1])
+                state["m"] = m
+                state["v"] = v
 
         return loss
 

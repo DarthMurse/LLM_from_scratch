@@ -29,6 +29,7 @@ class TrainConfig:
     eval_iter: int = 1000
     # gradient clipping
     clip_threshold = 1.0
+    dtype = torch.bfloat16
 
 def get_model_size(model):
     result = 0
@@ -58,8 +59,9 @@ def train_single(model, optimizer, train_loader, val_loader, config: TrainConfig
     start_time = time.time()
     for i, (x, y) in enumerate(train_loader):
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = loss_func(logits.flatten(end_dim=-2), y.flatten())
+        with torch.autocast(device_type=device, dtype=config.dtype):
+            logits = model(x)
+            loss = loss_func(logits.flatten(end_dim=-2), y.flatten())
 
         optimizer.zero_grad()
         loss.backward()
@@ -101,8 +103,9 @@ def validate_single(model, val_loader, config: TrainConfig, device):
         loss_func = CrossEntropyLoss()
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
-            loss = loss_func(model(x).flatten(end_dim=-2), y.flatten())
-            avg_loss = (count * avg_loss + x.shape[0] * loss) / (count + x.shape[0])
+            with torch.autocast(device_type=device, dtype=config.dtype):
+                loss = loss_func(model(x).flatten(end_dim=-2), y.flatten())
+                avg_loss = (count * avg_loss + x.shape[0] * loss) / (count + x.shape[0])
             count += x.shape[0]
     return avg_loss
 
@@ -116,7 +119,7 @@ def save_checkpoint(model, optimizer, i, save_path, config: TrainConfig):
     torch.save(checkpoint, save_path)
 
 def main():
-    device = "cuda:1"
+    device = "cuda"
     train_config = TrainConfig()
     model_config = ModelConfig()
     model = Transformer(model_config)
@@ -131,6 +134,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=train_config.batch_size)
     model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
     train_single(model, optimizer, train_loader, val_loader, train_config, device)
 
 if __name__ == "__main__":
