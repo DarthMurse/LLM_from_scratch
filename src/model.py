@@ -202,7 +202,7 @@ class Attention(nn.Module):
             v = v.repeat(1, self.config.q_per_kv, 1, 1)
 
         if inference:
-            atten_weight = softmax(q @ k.transpose(-1, -2) / math.sqrt(config.head_dim), dim=-1)
+            atten_weight = softmax(q @ k.transpose(-1, -2) / math.sqrt(self.config.head_dim), dim=-1)
             out = atten_weight @ v
         else:
             #out = torch_attention(q, k, v)

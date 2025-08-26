@@ -215,8 +215,9 @@ class attention(torch.autograd.Function):
         o_arg = torch.empty_like(q_arg)
         log = torch.empty([B*H, S], dtype=q_arg.dtype, device=q_arg.device)
         KERNEL_D = max(16, triton.next_power_of_2(D))
-        grid = lambda META: (B*H, triton.cdiv(S, META['TILE_SIZE']))
-        _attention_forward[grid](q_arg, k_arg, v_arg, o_arg, log, S, D, KERNEL_D=KERNEL_D)
+        with torch.cuda.device(q.device):
+            grid = lambda META: (B*H, triton.cdiv(S, META['TILE_SIZE']))
+            _attention_forward[grid](q_arg, k_arg, v_arg, o_arg, log, S, D, KERNEL_D=KERNEL_D)
         o = o_arg.reshape(B, H, S, D)
         ctx.save_for_backward(q_arg, k_arg, v_arg, o_arg, log)
         return o
@@ -230,8 +231,9 @@ class attention(torch.autograd.Function):
         dk_arg = torch.empty_like(do_arg)
         dv_arg = torch.empty_like(do_arg)
         KERNEL_D = max(16, triton.next_power_of_2(D))
-        grid = lambda META: (B*H, triton.cdiv(S, META['TILE_SIZE']))
-        _attention_backward[grid](do_arg, o_arg, q_arg, k_arg, v_arg, log, dq_arg, dk_arg, dv_arg, S, D, KERNEL_D)
+        with torch.cuda.device(do_arg.device):
+            grid = lambda META: (B*H, triton.cdiv(S, META['TILE_SIZE']))
+            _attention_backward[grid](do_arg, o_arg, q_arg, k_arg, v_arg, log, dq_arg, dk_arg, dv_arg, S, D, KERNEL_D)
         dq = dq_arg.reshape(B, H, S, D)
         dk = dk_arg.reshape(B, H, S, D)
         dv = dv_arg.reshape(B, H, S, D)

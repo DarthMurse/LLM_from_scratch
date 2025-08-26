@@ -4,7 +4,7 @@ from model import ModelConfig, Transformer, softmax
 from tokenizer import BPETokenizer
 from dataset import TextDataset, DataConfig
 
-def generate(model, input_ids, eos_id, temperature=0.9, top_p=0.9, max_new_token=200):
+def generate(model, input_ids, eos_id, temperature=1.0, top_p=0.9, max_new_token=200):
     # Assuming decoding a single batch of input_ids
     # input_ids: torch.LongTensor [1, S]
     out_token = []
@@ -16,7 +16,6 @@ def generate(model, input_ids, eos_id, temperature=0.9, top_p=0.9, max_new_token
     index = torch.multinomial(prob, 1)
     out_token.append(index.item())
     while index != eos_id and len(out_token) < max_new_token:
-        print(f"{len(out_token)} tokens generated.")
         new_token = torch.LongTensor([index]).to(input_ids.device).unsqueeze(0)
         out = model(new_token, inference=True)
         logits = out[0, -1] # [vocab_size]

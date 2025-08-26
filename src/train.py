@@ -1,6 +1,8 @@
 import torch 
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from dataclasses import dataclass
 import pandas as pd
 import os
@@ -10,10 +12,11 @@ from tokenizer import BPETokenizer
 from dataset import TextDataset, DataConfig
 from optimizer import AdamW, cosine_lr_schedule, gradient_clipping
 from model import Transformer, ModelConfig, CrossEntropyLoss
+from parallel import DDP, setup, get_ddp_dataloader
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 64
+    batch_size: int = 128
     resume: bool = False
     # Optimizer paramters
     lr = 4e-4
@@ -37,9 +40,18 @@ def get_model_size(model):
         result += p.numel()
     return result
 
-def train_single(model, optimizer, train_loader, val_loader, config: TrainConfig, device):
+def train_single(rank, world_size, model, train_set, val_set, config: TrainConfig):
+    device = f"cuda:{rank}"
+    model = model.to(device)
+    optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    ddp_model = DDP(model)
+    world_size = dist.get_world_size()
+    train_loader = get_ddp_dataloader(train_set, rank, world_size, config.batch_size)
+    val_loader = get_ddp_dataloader(val_set, rank, world_size, config.batch_size)
+
     save_base_dir = config.save_dir + config.name + '/'
-    if not os.path.exists(save_base_dir):
+    if not os.path.exists(save_base_dir) and rank == 0:
         os.mkdir(save_base_dir)
     train_logger = {"iter": [], "loss": []}
     eval_logger = {"iter": [], "loss": []}
@@ -60,30 +72,33 @@ def train_single(model, optimizer, train_loader, val_loader, config: TrainConfig
     for i, (x, y) in enumerate(train_loader):
         x, y = x.to(device), y.to(device)
         with torch.autocast(device_type=device, dtype=config.dtype):
-            logits = model(x)
+            logits = ddp_model(x)
             loss = loss_func(logits.flatten(end_dim=-2), y.flatten())
 
         optimizer.zero_grad()
         loss.backward()
-        gradient_clipping(model.parameters(), config.clip_threshold)
+        ddp_model.finish_gradient_synchronization()
+        gradient_clipping(ddp_model.parameters(), config.clip_threshold)
         cosine_lr_schedule(optimizer, t, config.lr, config.lr / 10, config.tw, config.tc)
         optimizer.step()
         
         if t % config.eval_iter == 0:
-            val_loss = validate_single(model, val_loader, config, device)
-            print(f"Iter {t}/{total_step}, time: {time.time()-start_time}s, train_loss: {loss.item()}, val_loss: {val_loss.item()}")
+            val_loss = validate_single(rank, ddp_model, val_loader, config, device)
+            if rank == 0:
+                print(f"Iter {t}/{total_step}, time: {time.time()-start_time}s, train_loss: {loss.item()}, val_loss: {val_loss.item()}")
             train_logger["iter"].append(t)
             eval_logger["iter"].append(t)
             train_logger["loss"].append(loss.item())
             eval_logger["loss"].append(val_loss.item())
             start_time = time.time()
         elif t % config.log_iter == 0:
-            print(f"Iter {t}/{total_step}, time: {time.time()-start_time}s, train_loss: {loss.item()}")
+            if rank == 0:
+                print(f"Iter {t}/{total_step}, time: {time.time()-start_time}s, train_loss: {loss.item()}")
             train_logger["iter"].append(t)
             train_logger["loss"].append(loss.item())
             start_time = time.time()
 
-        if t % config.save_iter == 0:
+        if t % config.save_iter == 0 and rank == 0:
             save_path = save_base_dir + f"iter_{t:06d}.ckpt"
             save_checkpoint(model, optimizer, t, save_path, config)
             pd.DataFrame(train_logger).to_csv(save_base_dir + "info_train.csv")
@@ -91,22 +106,24 @@ def train_single(model, optimizer, train_loader, val_loader, config: TrainConfig
         t += 1
     
     whole_duration = time.time() - whole_time
-    val_loss = validate_single(model, val_loader, config, device)
-    print(f"Training complete! Total iter {t}, total time: {whole_duration}s, final val_loss: {val_loss.item()}")
-    save_path = save_base_dir + f"iter_{t:06d}.ckpt"
-    save_checkpoint(model, optimizer, t, save_path, config)
+    val_loss = validate_single(rank, ddp_model, val_loader, config, device)
+    if rank == 0:
+        print(f"Training complete! Total iter {t}, total time: {whole_duration}s, final val_loss: {val_loss.item()}")
+        save_path = save_base_dir + f"iter_{t:06d}.ckpt"
+        save_checkpoint(model, optimizer, t, save_path, config)
 
-def validate_single(model, val_loader, config: TrainConfig, device):
+def validate_single(rank, model, val_loader, config: TrainConfig, device):
     avg_loss = 0
     count = 0
     with torch.no_grad():
         loss_func = CrossEntropyLoss()
-        for x, y in val_loader:
+        for i, (x, y) in enumerate(val_loader):
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device, dtype=config.dtype):
                 loss = loss_func(model(x).flatten(end_dim=-2), y.flatten())
                 avg_loss = (count * avg_loss + x.shape[0] * loss) / (count + x.shape[0])
             count += x.shape[0]
+        dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
     return avg_loss
 
 def save_checkpoint(model, optimizer, i, save_path, config: TrainConfig):
@@ -118,25 +135,22 @@ def save_checkpoint(model, optimizer, i, save_path, config: TrainConfig):
             }
     torch.save(checkpoint, save_path)
 
-def main():
-    device = "cuda"
+def main(rank, world_size):
+    setup(rank, world_size)
     train_config = TrainConfig()
     model_config = ModelConfig()
     model = Transformer(model_config)
     print(f"Model initialized with {get_model_size(model)} parameters.")
-    data_config = DataConfig(seq_len=257, batch_size=64)
+    data_config = DataConfig(seq_len=257, batch_size=train_config.batch_size)
     data_time = time.time()
     train_set = TextDataset("../data/tiny_story_train.pth", data_config)
     val_set = TextDataset("../data/tiny_story_valid.pth", data_config)
     data_duration = time.time() - data_time
     print(f"Dataset loading takes {data_duration} seconds ..")
-    train_loader = DataLoader(train_set, batch_size=train_config.batch_size)
-    val_loader = DataLoader(val_set, batch_size=train_config.batch_size)
-    model = model.to(device)
-    optimizer = AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
-    #optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
-    train_single(model, optimizer, train_loader, val_loader, train_config, device)
+    train_single(rank, world_size, model, train_set, val_set, train_config)
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-    main()
+    world_size = 8
+    mp.spawn(main, args=(world_size, ), nprocs=world_size, join=True)
