@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 import triton
 import triton.language as tl
 import math
@@ -23,7 +24,7 @@ def get_config():
 
 @triton.autotune(
         get_config(),
-        key=['S', 'D']
+        key=['S', 'D', 'KERNEL_D']
         )
 @triton.jit 
 def _attention_forward(q_ptr, k_ptr, v_ptr, o_ptr, log_ptr, S, D, KERNEL_D: tl.constexpr, TILE_SIZE: tl.constexpr):
@@ -71,7 +72,7 @@ def _attention_forward(q_ptr, k_ptr, v_ptr, o_ptr, log_ptr, S, D, KERNEL_D: tl.c
     o_tile = tl.zeros([TILE_SIZE, KERNEL_D], dtype=tl.float32)
     row_max = tl.zeros([TILE_SIZE], dtype=tl.float32) + float("-inf")
     row_exp_sum = tl.zeros([TILE_SIZE], dtype=tl.float32)
-    scale = 1.44269504089 / tl.sqrt(D * 1.0)
+    scale = 1 / tl.sqrt(D * 1.0)
     rows = tl.arange(0, TILE_SIZE)
     mask = rows[:, None] >= rows[None, :]
     for i in range(seq_idx + 1):
@@ -84,8 +85,8 @@ def _attention_forward(q_ptr, k_ptr, v_ptr, o_ptr, log_ptr, S, D, KERNEL_D: tl.c
             p_tile = tl.where(mask, p_tile, float("-inf"))
         row_max_tile = tl.max(p_tile, axis=1)
         new_row_max = tl.maximum(row_max_tile, row_max)
-        diff_exp = tl.math.exp2(row_max - new_row_max)
-        p_scale_exp = tl.math.exp2(p_tile - new_row_max[:, None])
+        diff_exp = tl.math.exp(row_max - new_row_max)
+        p_scale_exp = tl.math.exp(p_tile - new_row_max[:, None])
         row_exp_sum = row_exp_sum * diff_exp + tl.sum(p_scale_exp, axis=1)
         o_tile = diff_exp[:, None] * o_tile + tl.dot(p_scale_exp.to(v_tile.dtype), v_tile)
         row_max = new_row_max
@@ -93,11 +94,12 @@ def _attention_forward(q_ptr, k_ptr, v_ptr, o_ptr, log_ptr, S, D, KERNEL_D: tl.c
     cur_o_ptr = tl.advance(o_block_ptr, (seq_idx * TILE_SIZE, 0))
     tl.store(cur_o_ptr, o_tile.to(q_tile.dtype), boundary_check=(0, 1))
     cur_log_ptr = tl.advance(log_block_ptr, (seq_idx * TILE_SIZE,))
-    tl.store(cur_log_ptr, (row_max + tl.log2(row_exp_sum)).to(q_tile.dtype), boundary_check=(0,))
+    tl.store(cur_log_ptr, (row_max + tl.log(row_exp_sum)).to(q_tile.dtype), boundary_check=(0,))
 
 @triton.autotune(
         get_config(),
-        key=['S', 'D']
+        key=['S', 'D', 'KERNEL_D'],
+        reset_to_zero=['dq_ptr']
         )
 @triton.jit
 def _attention_backward(do_ptr, o_ptr, q_ptr, k_ptr, v_ptr, log_ptr, dq_ptr, dk_ptr, dv_ptr, S, D, KERNEL_D: tl.constexpr, TILE_SIZE: tl.constexpr):
@@ -140,12 +142,6 @@ def _attention_backward(do_ptr, o_ptr, q_ptr, k_ptr, v_ptr, log_ptr, dq_ptr, dk_
                                     block_shape=(TILE_SIZE, KERNEL_D), 
                                     order=(1, 0))
     dq_ptr += batch_offset * D
-    dq_block_ptr = tl.make_block_ptr(dq_ptr, 
-                                    shape=(S, D), 
-                                    strides=(D, 1), 
-                                    offsets=(0, 0), 
-                                    block_shape=(TILE_SIZE, KERNEL_D), 
-                                    order=(1, 0))
     dk_ptr += batch_offset * D
     dk_block_ptr = tl.make_block_ptr(dk_ptr, 
                                     shape=(S, D), 
@@ -169,25 +165,26 @@ def _attention_backward(do_ptr, o_ptr, q_ptr, k_ptr, v_ptr, log_ptr, dq_ptr, dk_
                                           order=(0,))
     
     rows = tl.arange(0, TILE_SIZE)
-    scale = 1.44269504089 / tl.sqrt(D * 1.0)
+    scale = 1.0 / tl.sqrt(D * 1.0)
     mask = rows[:, None] >= rows[None, :]
     cur_k_ptr = tl.advance(k_block_ptr, (seq_idx * TILE_SIZE, 0))
+    cur_v_ptr = tl.advance(v_block_ptr, (seq_idx * TILE_SIZE, 0))
     k_tile = tl.load(cur_k_ptr, boundary_check=(0, 1), padding_option="zero")
+    v_tile = tl.load(cur_v_ptr, boundary_check=(0, 1), padding_option="zero")
     dv_tile = tl.zeros([TILE_SIZE, KERNEL_D], dtype=tl.float32)
     dk_tile = tl.zeros([TILE_SIZE, KERNEL_D], dtype=tl.float32)
 
-    for i in range(seq_idx + 1):
-        offset_row = tl.arange(0, TILE_SIZE) + seq_idx * TILE_SIZE
+    for i in range(seq_idx, tl.cdiv(S, TILE_SIZE)):
+        offset_row = tl.arange(0, TILE_SIZE) + i * TILE_SIZE
         offset_col = tl.arange(0, KERNEL_D)
         cur_dq_ptr = dq_ptr + offset_row[:, None] * D + offset_col[None, :]
         dq_mask = (offset_row[:, None] < S) & (offset_col[None, :] < D)
+
         cur_q_ptr = tl.advance(q_block_ptr, (i * TILE_SIZE, 0))
-        cur_v_ptr = tl.advance(v_block_ptr, (i * TILE_SIZE, 0))
         cur_o_ptr = tl.advance(o_block_ptr, (i * TILE_SIZE, 0))
         cur_do_ptr = tl.advance(do_block_ptr, (i * TILE_SIZE, 0))
         cur_log_ptr = tl.advance(log_block_ptr, (i * TILE_SIZE,))
         q_tile = tl.load(cur_q_ptr, boundary_check=(0, 1), padding_option="zero")
-        v_tile = tl.load(cur_v_ptr, boundary_check=(0, 1), padding_option="zero")
         o_tile = tl.load(cur_o_ptr, boundary_check=(0, 1), padding_option="zero")
         do_tile = tl.load(cur_do_ptr, boundary_check=(0, 1), padding_option="zero")
         log_tile = tl.load(cur_log_ptr, boundary_check=(0,), padding_option="zero")
@@ -195,11 +192,11 @@ def _attention_backward(do_ptr, o_ptr, q_ptr, k_ptr, v_ptr, log_ptr, dq_ptr, dk_
         p_tile = tl.dot(q_tile, k_tile.trans(1, 0)) * scale 
         if i == seq_idx:
             p_tile = tl.where(mask, p_tile, float("-inf"))
-        p_tile = tl.math.exp2(p_tile - log_tile[:, None])
+        p_tile = tl.math.exp(p_tile - log_tile[:, None])
         dv_tile += tl.dot(p_tile.trans(1, 0).to(do_tile.dtype), do_tile)
-        dp_tile = p_tile * (tl.dot(do_tile.to(v_tile.dtype), v_tile.trans(1, 0)) - D_tile[:, None]) * scale
-        dk_tile += tl.dot(dp_tile.trans(1, 0).to(q_tile.dtype), q_tile)
-        dq_add = tl.dot(dp_tile.to(k_tile.dtype), k_tile)
+        ds_tile = p_tile * (tl.dot(do_tile.to(v_tile.dtype), v_tile.trans(1, 0)) - D_tile[:, None]) * scale
+        dk_tile += tl.dot(ds_tile.trans(1, 0).to(q_tile.dtype), q_tile)
+        dq_add = tl.dot(ds_tile.to(k_tile.dtype), k_tile)
         # Atomic add seems not to support block pointer, so using array of pointers instead.
         tl.atomic_add(cur_dq_ptr, dq_add, mask=dq_mask)
     cur_dv_ptr = tl.advance(dv_block_ptr, (seq_idx * TILE_SIZE, 0))
@@ -263,32 +260,38 @@ def relative_error(x1, x2, rel=True):
         return abs_error.max()
 
 def test():
-    dtype = torch.bfloat16
-    q1 = torch.rand([10, 20, 100, 50], requires_grad=True, dtype=dtype).to("cuda")
-    k1 = torch.rand([10, 20, 100, 50], requires_grad=True, dtype=dtype).to("cuda")
-    v1 = torch.rand([10, 20, 100, 50], requires_grad=True, dtype=dtype).to("cuda")
-    q2 = q1.clone()
-    k2 = k1.clone()
-    v2 = v1.clone()
-    dy = torch.rand_like(q1).to(torch.float32)
+    dtype = torch.float32
+    shape = [2, 8, 16, 16]
+    q1 = torch.rand(shape, requires_grad=True, dtype=dtype).to("cuda")
+    k1 = torch.rand(shape, requires_grad=True, dtype=dtype).to("cuda")
+    v1 = torch.rand(shape, requires_grad=True, dtype=dtype).to("cuda")
+    q2 = q1.clone().detach()
+    k2 = k1.clone().detach()
+    v2 = v1.clone().detach()
+    q2.requires_grad = True
+    k2.requires_grad = True
+    v2.requires_grad = True
 
     rel = False
-    out1 = torch_attention(q1, k1, v1).to(torch.float32)
-    out2 = triton_attention(q2, k2, v2).to(torch.float32)
+    out1 = triton_attention(q1, k1, v1).to(torch.float32)
+    out2 = torch_attention(q2, k2, v2).to(torch.float32)
     #print("torch attention forward: ", out1)
     #print("triton attention forward: ", out2)
     print("forward diff:", relative_error(out1, out2, rel))
     q1.retain_grad()
     k1.retain_grad()
     v1.retain_grad()
-    out1.backward(dy)
     #print("torch attention backward: ", q1.grad, k1.grad, v1.grad)
     q2.retain_grad()
     k2.retain_grad()
     v2.retain_grad()
-    out2.backward(dy)
+    loss1 = (out1 - 0.5).pow(2).mean()
+    loss2 = (out2 - 0.5).pow(2).mean()
+    loss1.backward()
+    loss2.backward()
     #print("triton attention backward: ", q2.grad, k2.grad, v2.grad)
     print("backward diff:", relative_error(q1.grad, q2.grad, rel), relative_error(k1.grad, k2.grad, rel), relative_error(v1.grad, v2.grad, rel))
+    #print(q1.grad[0, 0], q2.grad[0, 0])
 
 def benchmark_attention():
     from benchmark import benchmark
@@ -312,5 +315,6 @@ def benchmark_attention():
     benchmark(torch_func, warmup=30, rep=100)
 
 if __name__ == "__main__":
-    #test()
-    benchmark_attention()
+    torch.manual_seed(42)
+    test()
+    #benchmark_attention()
